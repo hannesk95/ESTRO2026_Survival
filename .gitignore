@@ -1,0 +1,12 @@
+# directories
+__pycache__
+_delete
+conda_env
+mlruns
+
+# files
+*.csv
+*.xlsx
+*.nii.gz
+*.pt
+*.ipynb
