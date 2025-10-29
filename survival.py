@@ -23,6 +23,9 @@ from lifelines import KaplanMeierFitter
 from lifelines.statistics import logrank_test
 import matplotlib.pyplot as plt
 import os
+from sklearn.inspection import permutation_importance
+from scipy.stats import pearsonr
+from scipy import stats
 
 RANDOM_STATE = 42
 
@@ -116,24 +119,25 @@ def get_data(histology:str, feature_set:str):
     
     match histology:
         case "syn":
-            data = sorted(glob("/home/johannes/Data/SSD_2.0TB/Duschinger/data/survival/duschinger/final_dataset/*SYN*.pt"))
+            data = sorted(glob("/home/johannes/Data/SSD_2.0TB/ESTRO2026_Survival/data/survival/duschinger/final_dataset/*SYN*.pt"))
         case "mfh":
-            data = sorted(glob("/home/johannes/Data/SSD_2.0TB/Duschinger/data/survival/duschinger/final_dataset/*MFH*.pt"))
+            data = sorted(glob("/home/johannes/Data/SSD_2.0TB/ESTRO2026_Survival/data/survival/duschinger/final_dataset/*MFH*.pt"))
         case "lipo":
-            data = sorted(glob("/home/johannes/Data/SSD_2.0TB/Duschinger/data/survival/duschinger/final_dataset/*Lipo*.pt"))
+            data = sorted(glob("/home/johannes/Data/SSD_2.0TB/ESTRO2026_Survival/data/survival/duschinger/final_dataset/*Lipo*.pt"))
         case "all":
-            data = sorted(glob("/home/johannes/Data/SSD_2.0TB/Duschinger/data/survival/duschinger/final_dataset/*.pt"))
+            data = sorted(glob("/home/johannes/Data/SSD_2.0TB/ESTRO2026_Survival/data/survival/duschinger/final_dataset/*.pt"))
         case "all_syn":
-            data = sorted(glob("/home/johannes/Data/SSD_2.0TB/Duschinger/data/survival/duschinger/final_dataset/*.pt"))
+            data = sorted(glob("/home/johannes/Data/SSD_2.0TB/ESTRO2026_Survival/data/survival/duschinger/final_dataset/*.pt"))
         case "all_mfh":
-            data = sorted(glob("/home/johannes/Data/SSD_2.0TB/Duschinger/data/survival/duschinger/final_dataset/*.pt"))
+            data = sorted(glob("/home/johannes/Data/SSD_2.0TB/ESTRO2026_Survival/data/survival/duschinger/final_dataset/*.pt"))
         case "all_lipo":
-            data = sorted(glob("/home/johannes/Data/SSD_2.0TB/Duschinger/data/survival/duschinger/final_dataset/*.pt"))
+            data = sorted(glob("/home/johannes/Data/SSD_2.0TB/ESTRO2026_Survival/data/survival/duschinger/final_dataset/*.pt"))
     
     match feature_set:
         case "volume":
             
             features = []
+            features_names = []
             labels_event = []
             labels_time = []
             histologies = []
@@ -143,7 +147,8 @@ def get_data(histology:str, feature_set:str):
                 dictionary = torch.load(file, map_location='cpu')
 
                 # volume only
-                features.append(dictionary["original_shape_VoxelVolume"])        
+                features.append(dictionary["original_shape_VoxelVolume"])
+                features_names.append("original_shape_VoxelVolume")        
                 
                 # Extract survival information from filename
                 filename_parts = file.split("/")[-1].split("_")
@@ -161,11 +166,12 @@ def get_data(histology:str, feature_set:str):
             y = np.array(list(zip(labels_event, labels_time)), dtype=[('event', bool), ('duration', np.float32)])
             events = np.array(labels_event)
             histologies = np.array(histologies)
-        
-            return X, y, events, histologies
+
+            return X, y, events, histologies, features_names
 
         case "clinical":
             features = []
+            features_names = []
             labels_event = []
             labels_time = []
             ages = []
@@ -211,14 +217,16 @@ def get_data(histology:str, feature_set:str):
             m_list = np.array(m_list).reshape(-1, 1)
             X = np.hstack([ages, grading_list, t_list, n_list, m_list])
             y = np.array(list(zip(labels_event, labels_time)), dtype=[('event', bool), ('duration', np.float32)])
+            features_names = ["Age", "Grading", "TNMT", "TNMN", "TNMM"]
             events = np.array(labels_event)
             histologies = np.array(histologies)
 
-            return X, y, events, histologies
+            return X, y, events, histologies, features_names
 
         case "radiomics":
 
             features = []
+            features_names = []
             labels_event = []
             labels_time = []
             histologies = []
@@ -229,6 +237,7 @@ def get_data(histology:str, feature_set:str):
 
                 # all features
                 features.append(list(dictionary.values()))
+                features_names = list(dictionary.keys())
                 
                 # Extract survival information from filename
                 filename_parts = file.split("/")[-1].split("_")
@@ -247,10 +256,11 @@ def get_data(histology:str, feature_set:str):
             events = np.array(labels_event)
             histologies = np.array(histologies)
 
-            return X, y, events, histologies
+            return X, y, events, histologies, features_names
 
         case "combined":
             features = []
+            features_names = []
             labels_event = []
             labels_time = []
             ages = []
@@ -278,6 +288,7 @@ def get_data(histology:str, feature_set:str):
                     t = df[df['Pseudonym'] == filename_parts[0]].TNMT.item()
                     n = df[df['Pseudonym'] == filename_parts[0]].TNMN.item()
                     m = df[df['Pseudonym'] == filename_parts[0]].TNMM.item()
+                    features_names = list(dictionary.keys()) + ["Age", "Grading", "TNMT", "TNMN", "TNMM"]
 
                     features.append(feature)
                     ages.append(age)
@@ -306,7 +317,7 @@ def get_data(histology:str, feature_set:str):
             events = np.array(labels_event)
             histologies = np.array(histologies)
 
-            return X, y, events, histologies
+            return X, y, events, histologies, features_names
 
 def main(model_type:str, histology:str, feature_set:str):
 
@@ -314,7 +325,7 @@ def main(model_type:str, histology:str, feature_set:str):
     mlflow.log_param("histology", histology)
     mlflow.log_param("feature_set", feature_set)
 
-    X, y, events, histologies = get_data(histology=histology, feature_set=feature_set)
+    X, y, events, histologies, features_names = get_data(histology=histology, feature_set=feature_set)
 
     # if histology in ["all_syn", "all_mfh", "all_lipo"]:
     events = [a + b for a, b in zip(list(events.astype(int).astype(str)), list(histologies))]
@@ -325,12 +336,17 @@ def main(model_type:str, histology:str, feature_set:str):
     outer_results_c_index = list()
     survival_times = list()
     high_risk_low_risk_labels = list()
+    feature_importance_mean_list = list()
+    feature_importance_std_list = list()
 
     for fold_idx, (train_ix, test_ix) in enumerate(cv_outer.split(X, events)):
         # split data
         X_train, X_test = X[train_ix, :], X[test_ix, :]
         y_train, y_test = y[train_ix], y[test_ix]
         histologies_train, histologies_test = histologies[train_ix], histologies[test_ix]
+
+        X_train_original, y_train_original = X_train.copy(), y_train.copy()
+        X_test_original, y_test_original = X_test.copy(), y_test.copy()
 
         if histology == "all_syn":       
 
@@ -352,6 +368,9 @@ def main(model_type:str, histology:str, feature_set:str):
 
             X_test = X_test[keep_index_test, :]
             y_test = y_test[keep_index_test]
+
+            X_train_original, y_train_original = X_train.copy(), y_train.copy()
+            X_test_original, y_test_original = X_test.copy(), y_test.copy()
         
         if histology == "all_mfh":       
 
@@ -373,6 +392,9 @@ def main(model_type:str, histology:str, feature_set:str):
 
             X_test = X_test[keep_index_test, :]
             y_test = y_test[keep_index_test]
+
+            X_train_original, y_train_original = X_train.copy(), y_train.copy()
+            X_test_original, y_test_original = X_test.copy(), y_test.copy()
         
         if histology == "all_lipo":       
 
@@ -395,6 +417,8 @@ def main(model_type:str, histology:str, feature_set:str):
             X_test = X_test[keep_index_test, :]
             y_test = y_test[keep_index_test]
 
+            X_train_original, y_train_original = X_train.copy(), y_train.copy()
+            X_test_original, y_test_original = X_test.copy(), y_test.copy()
         
         # configure the cross-validation procedure
         cv_inner = KFold(n_splits=3, shuffle=True, random_state=RANDOM_STATE)
@@ -423,6 +447,27 @@ def main(model_type:str, histology:str, feature_set:str):
         c_index = best_model.score(X_test, y_test)
         mlflow.log_metric(f"c_index_{fold_idx + 1}", c_index)
         outer_results_c_index.append(c_index)
+
+        # Feature importance
+        feature_importance_result = permutation_importance(best_model, X_test, y_test, n_repeats=100, random_state=0)
+        feature_importance_mean = feature_importance_result.importances_mean
+        feature_importance_std = feature_importance_result.importances_std
+        feature_importance_mean_list.append(feature_importance_mean)
+        feature_importance_std_list.append(feature_importance_std)
+        mlflow.log_param(f"feature_importance_mean_fold_{fold_idx + 1}", feature_importance_mean.tolist())
+        mlflow.log_param(f"feature_importance_std_fold_{fold_idx + 1}", feature_importance_std.tolist())
+        most_important_feature = int(np.argmax(feature_importance_mean))
+        pca_features = X_test[:, most_important_feature]
+
+        correlations = []
+        for i in range(X_test_original.shape[1]):
+            corr = pearsonr(pca_features, X_test_original[:, i])[0]
+            correlations.append(float(corr))
+
+        most_correlated_feature = int(np.argmax(np.abs(correlations)))
+        feature_name = features_names[most_correlated_feature]
+        mlflow.log_param(f"most_correlated_feature_fold_{fold_idx + 1}", feature_name)
+        print(f"Most correlated original feature for fold {fold_idx + 1}: {feature_name}")
 
         # report progress
         print(f"Fold {fold_idx + 1}:")
@@ -476,14 +521,33 @@ def main(model_type:str, histology:str, feature_set:str):
     mlflow.log_artifact(f"km_curve_model_{model_type}_histology_{histology}_features_{feature_set}.png")
     os.remove(f"km_curve_model_{model_type}_histology_{histology}_features_{feature_set}.png")
 
+    # T-Test - Compute t-statistic
+    null_hypothesis = 0.5
+    n_folds = 5
+    mean_score = mean(outer_results_c_index)
+    std_score = std(outer_results_c_index)
+    t_stat = (mean_score - null_hypothesis) / (std_score / np.sqrt(n_folds))
+
+    # Degrees of freedom
+    df = n_folds - 1
+
+    # One-sided p-value (testing if mean > 0.5)
+    p_value_one_sided = 1 - stats.t.cdf(t_stat, df)
+    mlflow.log_metric("t_test_one_sided_p_value", p_value_one_sided)
+
+    # Two-sided p-value (if you just want to test mean ≠ 0.5)
+    p_value_two_sided = stats.t.sf(np.abs(t_stat), df) * 2
+    mlflow.log_metric("t_test_two_sided_p_value", p_value_two_sided)
+
 if __name__ == "__main__":
 
     for feature_set in ['volume', 'clinical', 'radiomics', 'combined']:
-        for model_type in ['svm', 'rf']:
+        # for model_type in ['svm', 'rf']:
+        for model_type in ['rf']:
             for histology in ['syn', 'all_syn', 'mfh', 'all_mfh', 'lipo', 'all_lipo', 'all']:
                 print(f"Model type: {model_type}, Histology: {histology}, Feature set: {feature_set}")
 
-                mlflow.set_experiment("survival")
+                mlflow.set_experiment("survival_test_feature_importance")
                 mlflow.start_run()
                 main(model_type=model_type, histology=histology, feature_set=feature_set)
                 mlflow.end_run()
