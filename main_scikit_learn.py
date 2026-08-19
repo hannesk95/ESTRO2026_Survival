@@ -1,6 +1,7 @@
 """
 Soft tissue sarcoma survival modelling — histology-specific vs. histology-agnostic
-vs. sample-size-matched (experiment B2), all three evaluated in a single run.
+vs. sample-size-matched (experiment B2), all three evaluated in a single run,
+with a late-fusion RSF + ExtraSurvivalTrees ensemble as an additional model type.
 
 For every (model_type, histology, feature_set) combination this script fits:
 
@@ -19,11 +20,15 @@ Reading the result:
   matched >  specific  -> genuine transferable signal across histologies
   matched <  specific  -> other histologies actively dilute the subtype-specific signal
 
+Model types: rsf, extra_trees, gradient_boosting, cox_ph, cox_elastic, svm,
+             lipschitz_svm, ensemble
+
 --------------------------------------------------------------------------------
 Two bugs from the original script remain fixed here — see [FIX 1] and [FIX 2].
 --------------------------------------------------------------------------------
 """
 
+import os
 import mlflow
 import numpy as np
 import pandas as pd
@@ -31,6 +36,7 @@ import matplotlib.pyplot as plt
 
 from scipy.stats import rankdata
 
+from sklearn.base import BaseEstimator
 from sklearn.model_selection import StratifiedKFold, GridSearchCV, RepeatedKFold
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
@@ -63,8 +69,11 @@ N_INNER_SPLITS = 5
 
 # Inner-CV repeats. The original value of 100 meant 500 fits per candidate; with
 # most param grids empty that was 500 fits to choose between one option. Empty
-# grids now skip GridSearchCV entirely (see fit_model).
+# grids now skip GridSearchCV entirely (see fit_model). Large grids (the
+# ensemble has 45 candidates) automatically drop to a single repeat.
 N_INNER_REPEATS = 3
+N_INNER_REPEATS_LARGE_GRID = 1
+LARGE_GRID_THRESHOLD = 20
 
 # --- B2 parameters -----------------------------------------------------------
 N_MATCHED_REPEATS = 100         # subsampling repetitions per outer fold
@@ -78,8 +87,10 @@ MATCHED_RETUNE = False          # False: reuse the hyperparameters selected by t
                                 #        fit of the same fold (fast; isolates the effect of
                                 #        training-set size from tuning noise)
                                 # True:  re-run the inner CV for every repetition
-                                #        (~20x slower, fully nested)
+                                #        (much slower, fully nested)
 MIN_EVENTS_IN_TRAIN = 3         # redraw guard
+
+PCA_VARIANCE_GRID = [None, 0.80, 0.90, 0.95, 0.99]
 
 DATA_CSV = "/home/johannes/Data/SSD_2.0TB/ESTRO2026_Survival/journal_extension_data.csv"
 MEMORY = Memory(
@@ -92,24 +103,33 @@ REGIMES = ("specific", "agnostic", "matched")
 
 HISTOLOGY_LABELS = {"syn": "SYN", "mfh": "MFH", "lipo": "Liposarcoma"}
 
+COVARIATE_TOKENS = {"volume", "clinical"}
+IMAGING_TOKENS = {"radiomics", "ctfm", "omnislicer"}
+
 
 # =============================================================================
 # Data loading
 # =============================================================================
 
+def feature_set_blocks(feature_set):
+    """Return (has_covariate_block, has_imaging_block)."""
+    tokens = set(feature_set.split("_"))
+    unknown = tokens - COVARIATE_TOKENS - IMAGING_TOKENS
+    if unknown:
+        raise ValueError(f"Unsupported feature set token(s): {sorted(unknown)}")
+    return bool(tokens & COVARIATE_TOKENS), bool(tokens & IMAGING_TOKENS)
+
+
 def _feature_columns(df, feature_set):
     """
     Return (covariate_columns, imaging_columns) for a feature set.
 
-    Column ORDER matters downstream: the pipeline assumes
+    Column ORDER matters downstream: the pipeline and the ensemble both assume
         [covariates ...][imaging ...]
-    which is the order the original script built its arrays in.
+    which is the order get_data() builds its arrays in.
     """
     tokens = feature_set.split("_")
-    known = {"volume", "clinical", "radiomics", "ctfm", "omnislicer"}
-    unknown = set(tokens) - known
-    if unknown:
-        raise ValueError(f"Unsupported feature set token(s): {sorted(unknown)}")
+    feature_set_blocks(feature_set)  # validation
 
     covariate_cols = []
     if "volume" in tokens:
@@ -168,6 +188,98 @@ def get_data(histology, feature_set):
 
 
 # =============================================================================
+# Late-fusion ensemble
+# =============================================================================
+
+class SurvivalEnsemble(BaseEstimator):
+    """
+    Late-fusion ensemble that fits:
+      - a RandomSurvivalForest on the low-dimensional covariate block
+        (volume, age, grading, T/N stage), and
+      - an ExtraSurvivalTrees model on the high-dimensional imaging block
+        (radiomics / ctfm / omnislicer),
+    then combines the two risk scores as a weighted average after
+    z-standardizing each score using statistics learned on the TRAINING data
+    (so there is no leakage at predict time).
+
+        combined = weight * risk_covariate_z + (1 - weight) * risk_imaging_z
+
+    weight = 1.0 -> pure RSF (covariates only)
+    weight = 0.0 -> pure Extra Trees (imaging only)
+
+    `weight` and `imaging_pca_components` are exposed as hyperparameters so they
+    are tuned by the inner GridSearchCV inside the outer nested CV.
+    """
+
+    def __init__(
+        self,
+        clinical_idx=None,
+        imaging_idx=None,
+        weight=0.5,
+        imaging_pca_components=None,
+        rsf_kwargs=None,
+        ext_kwargs=None,
+        random_state=RANDOM_STATE,
+    ):
+        self.clinical_idx = clinical_idx
+        self.imaging_idx = imaging_idx
+        self.weight = weight
+        self.imaging_pca_components = imaging_pca_components
+        self.rsf_kwargs = rsf_kwargs
+        self.ext_kwargs = ext_kwargs
+        self.random_state = random_state
+
+    def fit(self, X, y):
+        rsf_kwargs = self.rsf_kwargs or {}
+        ext_kwargs = self.ext_kwargs or {}
+
+        X = np.asarray(X)
+        X_clin = X[:, self.clinical_idx]
+        X_img = X[:, self.imaging_idx]
+
+        if self.imaging_pca_components is not None:
+            # svd_solver='full' is required for fractional n_components
+            self.imaging_pca_ = PCA(
+                n_components=self.imaging_pca_components,
+                svd_solver="full",
+                random_state=self.random_state,
+            )
+            X_img = self.imaging_pca_.fit_transform(X_img)
+        else:
+            self.imaging_pca_ = None
+
+        self.rsf_ = RandomSurvivalForest(random_state=self.random_state, **rsf_kwargs)
+        self.ext_ = ExtraSurvivalTrees(random_state=self.random_state, **ext_kwargs)
+
+        self.rsf_.fit(X_clin, y)
+        self.ext_.fit(X_img, y)
+
+        # training-set risk-score statistics, used to standardize at predict time
+        train_risk_clin = self.rsf_.predict(X_clin)
+        train_risk_img = self.ext_.predict(X_img)
+
+        self.clin_mean_ = train_risk_clin.mean()
+        self.clin_std_ = train_risk_clin.std() + 1e-12
+        self.img_mean_ = train_risk_img.mean()
+        self.img_std_ = train_risk_img.std() + 1e-12
+
+        return self
+
+    def predict(self, X):
+        X = np.asarray(X)
+        X_clin = X[:, self.clinical_idx]
+        X_img = X[:, self.imaging_idx]
+
+        if self.imaging_pca_ is not None:
+            X_img = self.imaging_pca_.transform(X_img)
+
+        risk_clin = (self.rsf_.predict(X_clin) - self.clin_mean_) / self.clin_std_
+        risk_img = (self.ext_.predict(X_img) - self.img_mean_) / self.img_std_
+
+        return self.weight * risk_clin + (1 - self.weight) * risk_img
+
+
+# =============================================================================
 # Model / pipeline
 # =============================================================================
 
@@ -177,14 +289,15 @@ def get_model_and_param_grid(model_type, feature_set, n_covariates):
 
     get_data() builds combined feature vectors as
         [volume?, Age, Grading, TNMT, TNMN?] + [imaging features ...]
-    i.e. covariates FIRST. The original ColumnTransformer sent
+    i.e. covariates FIRST — which is exactly what SurvivalEnsemble assumes with
+    clinical_idx = slice(0, n_covariates). The original ColumnTransformer sent
     slice(0, n_passthrough) to PCA and slice(n_passthrough, None) to
-    "passthrough" — so PCA compressed the 4-5 clinical covariates while the full
-    high-dimensional radiomics / ctfm / omnislicer block went into the model raw
-    and unreduced. Every combined feature set is affected.
+    "passthrough", i.e. it compressed the 4-5 clinical covariates and let the
+    full high-dimensional imaging block through raw. Every combined feature set
+    is affected. The ensemble's own indexing was already correct.
     """
-    has_imaging = feature_set not in ("volume", "clinical", "volume_clinical")
-    use_pca = has_imaging and model_type not in ("cox_elastic", "cox_ph")
+    has_covariates, has_imaging = feature_set_blocks(feature_set)
+    use_pca = has_imaging and model_type not in ("cox_elastic", "cox_ph", "ensemble")
 
     if use_pca:
         # svd_solver='full' is required for fractional n_components (0.80, 0.90, ...)
@@ -208,6 +321,8 @@ def get_model_and_param_grid(model_type, feature_set, n_covariates):
         preprocessor = "passthrough"
         pca_param_name = None
 
+    param_grid = {}
+
     if model_type == "rsf":
         clf = RandomSurvivalForest(random_state=RANDOM_STATE)
     elif model_type == "extra_trees":
@@ -222,6 +337,24 @@ def get_model_and_param_grid(model_type, feature_set, n_covariates):
         clf = FastSurvivalSVM(random_state=RANDOM_STATE)
     elif model_type == "lipschitz_svm":
         clf = MinlipSurvivalAnalysis()
+
+    elif model_type == "ensemble":
+        if not has_covariates or not has_imaging:
+            raise ValueError(
+                f"feature_set='{feature_set}' does not have both a covariate block "
+                "and an imaging block — the ensemble needs both. "
+                "Use e.g. 'volume_clinical_radiomics' instead."
+            )
+        clf = SurvivalEnsemble(
+            clinical_idx=slice(0, n_covariates),
+            imaging_idx=slice(n_covariates, None),
+            random_state=RANDOM_STATE,
+        )
+        param_grid = {
+            "clf__weight": np.round(np.linspace(0.1, 0.9, 9), 2).tolist(),
+            "clf__imaging_pca_components": PCA_VARIANCE_GRID,
+        }
+
     else:
         raise ValueError(f"Unsupported model type: {model_type}")
 
@@ -230,15 +363,21 @@ def get_model_and_param_grid(model_type, feature_set, n_covariates):
         memory=MEMORY,
     )
 
-    param_grid = {}
     if use_pca:
-        param_grid[pca_param_name] = [0.80, 0.90, 0.95, 0.99]
+        param_grid[pca_param_name] = PCA_VARIANCE_GRID
 
     return pipeline, param_grid
 
 
+def _n_grid_candidates(param_grid):
+    n = 1
+    for values in param_grid.values():
+        n *= len(values)
+    return n
+
+
 def fit_model(model_type, feature_set, n_covariates, X_train, y_train,
-              fixed_params=None, n_inner_repeats=N_INNER_REPEATS):
+              fixed_params=None):
     """
     Fit the pipeline. If fixed_params is given, skip tuning and use them directly.
     If the param grid is empty, skip GridSearchCV — the original script ran 500
@@ -256,8 +395,13 @@ def fit_model(model_type, feature_set, n_covariates, X_train, y_train,
         pipeline.fit(X_train, y_train)
         return pipeline, {}
 
+    n_repeats = (
+        N_INNER_REPEATS_LARGE_GRID
+        if _n_grid_candidates(param_grid) > LARGE_GRID_THRESHOLD
+        else N_INNER_REPEATS
+    )
     cv_inner = RepeatedKFold(
-        n_splits=N_INNER_SPLITS, n_repeats=n_inner_repeats, random_state=RANDOM_STATE
+        n_splits=N_INNER_SPLITS, n_repeats=n_repeats, random_state=RANDOM_STATE
     )
     grid_search = GridSearchCV(
         pipeline, param_grid, scoring=score_survival_model,
@@ -265,6 +409,33 @@ def fit_model(model_type, feature_set, n_covariates, X_train, y_train,
     )
     grid_search.fit(X_train, y_train)
     return grid_search.best_estimator_, grid_search.best_params_
+
+
+def log_fitted_model_info(best_model, model_type, regime, fold_idx):
+    """Log the number of retained PCA components and the ensemble weight."""
+    preprocessor = best_model.named_steps["preprocessor"]
+
+    n_pca = None
+    if isinstance(preprocessor, PCA):
+        n_pca = preprocessor.n_components_
+    elif isinstance(preprocessor, ColumnTransformer):
+        n_pca = preprocessor.named_transformers_["pca"].n_components_
+
+    if n_pca is not None:
+        mlflow.log_metric(f"{regime}_n_pca_components_fold_{fold_idx}", int(n_pca))
+
+    if model_type == "ensemble":
+        clf = best_model.named_steps["clf"]
+        mlflow.log_metric(f"{regime}_ensemble_weight_fold_{fold_idx}", float(clf.weight))
+        mlflow.log_param(
+            f"{regime}_ensemble_imaging_pca_fold_{fold_idx}",
+            clf.imaging_pca_components,
+        )
+        if getattr(clf, "imaging_pca_", None) is not None:
+            mlflow.log_metric(
+                f"{regime}_ensemble_n_pca_components_fold_{fold_idx}",
+                int(clf.imaging_pca_.n_components_),
+            )
 
 
 # =============================================================================
@@ -401,6 +572,7 @@ def kaplan_meier_by_risk(y_primary, risk_scores, tag, title):
     plt.savefig(filename, dpi=300)
     plt.close()
     mlflow.log_artifact(filename)
+    os.remove(filename)
 
     return chisq, pvalue
 
@@ -438,6 +610,7 @@ def main(model_type, histology, feature_set):
     mlflow.log_metric("n_events_primary", int(events_primary.sum()))
     mlflow.log_metric("n_events_secondary", int(events_secondary.sum()))
     mlflow.log_metric("n_features", X.shape[1])
+    mlflow.log_metric("n_covariates", n_covariates)
 
     if n_secondary == 0:
         raise ValueError("No secondary histologies found — agnostic/matched impossible.")
@@ -478,6 +651,7 @@ def main(model_type, histology, feature_set):
             model_type, feature_set, n_covariates, X_tr_primary, y_tr_primary
         )
         risk["specific"][test_idx] = model_spec.predict(X_test)
+        log_fitted_model_info(model_spec, model_type, "specific", fold_idx)
 
         # --- agnostic --------------------------------------------------------
         X_tr_pooled = np.vstack([X_tr_primary, X_secondary])
@@ -487,6 +661,7 @@ def main(model_type, histology, feature_set):
             model_type, feature_set, n_covariates, X_tr_pooled, y_tr_pooled
         )
         risk["agnostic"][test_idx] = model_agn.predict(X_test)
+        log_fitted_model_info(model_agn, model_type, "agnostic", fold_idx)
 
         for regime in ("specific", "agnostic"):
             c = concordance_index_censored(
@@ -523,7 +698,8 @@ def main(model_type, histology, feature_set):
 
         # Reusing the agnostic fold's hyperparameters isolates the effect of
         # training-set size from tuning noise, and avoids re-running the inner CV
-        # N_MATCHED_REPEATS times. No test-fold leakage: the agnostic fit never
+        # N_MATCHED_REPEATS times — which matters most for the ensemble, whose
+        # grid has 45 candidates. No test-fold leakage: the agnostic fit never
         # saw these test patients either.
         fixed = None if MATCHED_RETUNE else params_agn
 
@@ -591,6 +767,7 @@ def main(model_type, histology, feature_set):
     plt.savefig("matched_c_index_distribution.png", dpi=300)
     plt.close()
     mlflow.log_artifact("matched_c_index_distribution.png")
+    os.remove("matched_c_index_distribution.png")
 
     # -------------------------------------------------------------------------
     # 5. Per-regime metrics
@@ -664,6 +841,8 @@ def main(model_type, histology, feature_set):
     )
     mlflow.log_artifact("oof_risk_scores.npz")
 
+    os.remove("oof_risk_scores.npz")
+
 
 # =============================================================================
 # Entry point
@@ -677,14 +856,22 @@ if __name__ == "__main__":
         "clinical_radiomics", "clinical_ctfm", "clinical_omnislicer",
         "volume_clinical_radiomics", "volume_clinical_ctfm", "volume_clinical_omnislicer",
     ]
-    MODEL_TYPES = ["rsf", "extra_trees", "gradient_boosting",
-                   "cox_elastic", "svm", "lipschitz_svm"]
+    MODEL_TYPES = [
+        "rsf", "extra_trees", "gradient_boosting", "ensemble",
+    ]
     HISTOLOGIES = ["syn", "mfh", "lipo"]
 
-    mlflow.set_experiment("DEGRO_journal_extension_matched")
+    mlflow.set_experiment("European_Journal_of_Radiology")
 
     for feature_set in FEATURE_SETS:
+        has_covariates, has_imaging = feature_set_blocks(feature_set)
+
         for model_type in MODEL_TYPES:
+
+            # the ensemble needs both a covariate block and an imaging block
+            if model_type == "ensemble" and not (has_covariates and has_imaging):
+                continue
+
             for histology in HISTOLOGIES:
 
                 print("\n" + "#" * 79)
