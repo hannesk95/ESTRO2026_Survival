@@ -1,38 +1,32 @@
 """
-Soft tissue sarcoma survival modelling — histology-specific vs. histology-agnostic
-vs. sample-size-matched (experiment B2), all three evaluated in a single run,
-with a late-fusion RSF + ExtraSurvivalTrees ensemble as an additional model type.
-
-For every (model_type, histology, feature_set) combination this script fits:
+Soft tissue sarcoma survival modelling — four training regimes in one run.
 
   'specific'  train on the primary-histology training fold only
-  'agnostic'  train on the primary-histology training fold + ALL other histologies
-  'matched'   train on a random subsample of (training fold + other histologies)
-              whose SIZE and EVENT COUNT equal the 'specific' training fold,
-              repeated N_MATCHED_REPEATS times
+  'agnostic'  pooled training, histology NOT a feature          (regime 2)
+  'aware'     pooled training, histology one-hot AS a feature   (regime 3)
+  'matched'   pooled training subsampled to the size and event count of the
+              specific training fold, repeated N_MATCHED_REPEATS times
 
-All three share the SAME outer folds and the SAME test patients, so the comparison
-is paired. The script reports paired bootstrap confidence intervals on the
-C-index differences, which is the number that goes in the paper.
+All four share the SAME outer folds and the SAME test patients, so every
+comparison is paired. Paired bootstrap CIs on the C-index differences are the
+inferential quantity.
 
-Reading the result:
-  matched ~= specific  -> the agnostic gain is explained by training-set size alone
-  matched >  specific  -> genuine transferable signal across histologies
-  matched <  specific  -> other histologies actively dilute the subtype-specific signal
+Regime 3 is the one that maps onto SARCULATOR, which is itself a pooled model
+with histological subtype as an input. The hypothesis it tests: pooling failed
+for synovial sarcoma because the model was forced to average across subtypes;
+given the subtype label it should be able to keep a synovial-specific rule
+while still learning general structure from the other 192 patients.
 
 Model types: rsf, extra_trees, gradient_boosting, cox_ph, cox_elastic, svm,
              lipschitz_svm, ensemble
 
---------------------------------------------------------------------------------
-Two bugs from the original script remain fixed here — see [FIX 1] and [FIX 2].
---------------------------------------------------------------------------------
+Two bugs from the original script remain fixed — see [FIX 1] and [FIX 2].
 """
 
-import os
-import mlflow
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import mlflow
 
 from scipy.stats import rankdata
 
@@ -67,28 +61,25 @@ N_BOOTSTRAP = 1000
 N_OUTER_SPLITS = 5
 N_INNER_SPLITS = 5
 
-# Inner-CV repeats. The original value of 100 meant 500 fits per candidate; with
-# most param grids empty that was 500 fits to choose between one option. Empty
-# grids now skip GridSearchCV entirely (see fit_model). Large grids (the
-# ensemble has 45 candidates) automatically drop to a single repeat.
 N_INNER_REPEATS = 3
 N_INNER_REPEATS_LARGE_GRID = 1
 LARGE_GRID_THRESHOLD = 20
 
-# --- B2 parameters -----------------------------------------------------------
-N_MATCHED_REPEATS = 100         # subsampling repetitions per outer fold
-MATCH_EVENT_COUNT = True        # match number of EVENTS, not just number of patients.
-                                # C-index precision is driven by events, so this is
-                                # the tighter control and the one to report.
-MATCHED_PRIMARY_FRACTION = None # None -> free draw from the pooled training set
-                                # 0.0  -> pure cross-histology transfer (no primary patients)
-                                # 0.5  -> half the budget forced to be primary histology
-MATCHED_RETUNE = False          # False: reuse the hyperparameters selected by the agnostic
-                                #        fit of the same fold (fast; isolates the effect of
-                                #        training-set size from tuning noise)
-                                # True:  re-run the inner CV for every repetition
-                                #        (much slower, fully nested)
-MIN_EVENTS_IN_TRAIN = 3         # redraw guard
+# --- B2 (matched) ------------------------------------------------------------
+N_MATCHED_REPEATS = 100
+MATCH_EVENT_COUNT = True
+MATCHED_PRIMARY_FRACTION = None
+MATCHED_RETUNE = False
+MIN_EVENTS_IN_TRAIN = 3
+
+# --- regime 3 (aware) --------------------------------------------------------
+# Fixed category order so the one-hot columns mean the same thing in every run,
+# whichever subtype happens to be primary.
+HISTOLOGY_CATEGORIES = ["SYN", "MFH", "Liposarcoma"]
+
+# How much does the aware model actually rely on knowing the subtype? Permute
+# the histology columns of the test fold and measure the C-index drop.
+N_PERMUTATION_REPEATS = 20
 
 PCA_VARIANCE_GRID = [None, 0.80, 0.90, 0.95, 0.99]
 
@@ -99,7 +90,7 @@ MEMORY = Memory(
 
 EVENT_FIELD = "event"
 TIME_FIELD = "duration"
-REGIMES = ("specific", "agnostic", "matched")
+REGIMES = ("specific", "agnostic", "aware", "matched")
 
 HISTOLOGY_LABELS = {"syn": "SYN", "mfh": "MFH", "lipo": "Liposarcoma"}
 
@@ -110,6 +101,15 @@ IMAGING_TOKENS = {"radiomics", "ctfm", "omnislicer"}
 # =============================================================================
 # Data loading
 # =============================================================================
+
+_DF_CACHE = {}
+
+
+def _load_df(path=DATA_CSV):
+    if path not in _DF_CACHE:
+        _DF_CACHE[path] = pd.read_csv(path)
+    return _DF_CACHE[path]
+
 
 def feature_set_blocks(feature_set):
     """Return (has_covariate_block, has_imaging_block)."""
@@ -122,14 +122,13 @@ def feature_set_blocks(feature_set):
 
 def _feature_columns(df, feature_set):
     """
-    Return (covariate_columns, imaging_columns) for a feature set.
+    Return (covariate_columns, imaging_columns).
 
     Column ORDER matters downstream: the pipeline and the ensemble both assume
         [covariates ...][imaging ...]
-    which is the order get_data() builds its arrays in.
     """
     tokens = feature_set.split("_")
-    feature_set_blocks(feature_set)  # validation
+    feature_set_blocks(feature_set)
 
     covariate_cols = []
     if "volume" in tokens:
@@ -150,15 +149,42 @@ def _feature_columns(df, feature_set):
     return covariate_cols, imaging_cols
 
 
-def get_data(histology, feature_set):
+def _histology_dummies(sub):
+    """
+    One-hot, NOT ordinal.
+
+    Encoding the subtype as 0/1/2 would tell the model that MFH sits 'between'
+    SYN and Liposarcoma and that the gap SYN->MFH equals MFH->Liposarcoma. Both
+    are meaningless. A tree would then only be able to split on that invented
+    ordering, e.g. '{SYN} vs {MFH, Liposarcoma}', and could never isolate MFH
+    alone with a single split.
+
+    Categories are pinned so the columns are identical across runs.
+    """
+    cat = pd.Categorical(sub["histology"], categories=HISTOLOGY_CATEGORIES)
+    if cat.isna().any():
+        bad = sorted(set(sub["histology"]) - set(HISTOLOGY_CATEGORIES))
+        raise ValueError(f"Unmapped histology label(s): {bad}")
+    return pd.get_dummies(cat, prefix="hist").to_numpy(dtype=np.float64)
+
+
+def get_data(histology, feature_set, include_histology=False):
     """
     Primary-histology patients first, then all other histologies.
-    Equivalent to the original get_data(), without the per-feature-set duplication.
+
+    include_histology=True inserts the one-hot subtype columns at the END of the
+    covariate block, i.e. inside the PCA passthrough region:
+
+        [volume?, Age, Grading, TNMT, TNMN?, hist_SYN, hist_MFH, hist_Lipo][imaging ...]
+
+    Putting them anywhere after n_covariates would feed them into PCA, which
+    would mix a categorical indicator into continuous imaging components and
+    destroy the thing regime 3 is trying to test.
     """
     if histology not in HISTOLOGY_LABELS:
         raise ValueError(f"Unsupported histology: {histology}")
 
-    df = pd.read_csv(DATA_CSV)
+    df = _load_df()
     label = HISTOLOGY_LABELS[histology]
 
     primary_ids = sorted(df.loc[df["histology"] == label, "Pseudonym"].tolist())
@@ -166,11 +192,19 @@ def get_data(histology, feature_set):
     patient_ids = primary_ids + secondary_ids
 
     covariate_cols, imaging_cols = _feature_columns(df, feature_set)
-    feature_cols = covariate_cols + imaging_cols
-
     sub = df.set_index("Pseudonym").loc[patient_ids]
 
-    X = sub[feature_cols].to_numpy(dtype=np.float64)
+    blocks = [sub[covariate_cols].to_numpy(dtype=np.float64)] if covariate_cols else []
+    n_covariates = len(covariate_cols)
+
+    if include_histology:
+        blocks.append(_histology_dummies(sub))
+        n_covariates += len(HISTOLOGY_CATEGORIES)
+
+    if imaging_cols:
+        blocks.append(sub[imaging_cols].to_numpy(dtype=np.float64))
+
+    X = np.hstack(blocks) if blocks else np.empty((len(sub), 0))
     if X.ndim == 1:
         X = X.reshape(-1, 1)
 
@@ -184,7 +218,7 @@ def get_data(histology, feature_set):
     )
 
     return (X, y, times, events, histologies,
-            len(primary_ids), len(secondary_ids), len(covariate_cols))
+            len(primary_ids), len(secondary_ids), n_covariates)
 
 
 # =============================================================================
@@ -193,34 +227,16 @@ def get_data(histology, feature_set):
 
 class SurvivalEnsemble(BaseEstimator):
     """
-    Late-fusion ensemble that fits:
-      - a RandomSurvivalForest on the low-dimensional covariate block
-        (volume, age, grading, T/N stage), and
-      - an ExtraSurvivalTrees model on the high-dimensional imaging block
-        (radiomics / ctfm / omnislicer),
-    then combines the two risk scores as a weighted average after
-    z-standardizing each score using statistics learned on the TRAINING data
-    (so there is no leakage at predict time).
+    RandomSurvivalForest on the covariate block + ExtraSurvivalTrees on the
+    imaging block, combined as a weighted average of z-standardised risk scores
+    using training-set statistics (no leakage at predict time).
 
         combined = weight * risk_covariate_z + (1 - weight) * risk_imaging_z
-
-    weight = 1.0 -> pure RSF (covariates only)
-    weight = 0.0 -> pure Extra Trees (imaging only)
-
-    `weight` and `imaging_pca_components` are exposed as hyperparameters so they
-    are tuned by the inner GridSearchCV inside the outer nested CV.
     """
 
-    def __init__(
-        self,
-        clinical_idx=None,
-        imaging_idx=None,
-        weight=0.5,
-        imaging_pca_components=None,
-        rsf_kwargs=None,
-        ext_kwargs=None,
-        random_state=RANDOM_STATE,
-    ):
+    def __init__(self, clinical_idx=None, imaging_idx=None, weight=0.5,
+                 imaging_pca_components=None, rsf_kwargs=None, ext_kwargs=None,
+                 random_state=RANDOM_STATE):
         self.clinical_idx = clinical_idx
         self.imaging_idx = imaging_idx
         self.weight = weight
@@ -234,48 +250,32 @@ class SurvivalEnsemble(BaseEstimator):
         ext_kwargs = self.ext_kwargs or {}
 
         X = np.asarray(X)
-        X_clin = X[:, self.clinical_idx]
-        X_img = X[:, self.imaging_idx]
+        X_clin, X_img = X[:, self.clinical_idx], X[:, self.imaging_idx]
 
         if self.imaging_pca_components is not None:
-            # svd_solver='full' is required for fractional n_components
-            self.imaging_pca_ = PCA(
-                n_components=self.imaging_pca_components,
-                svd_solver="full",
-                random_state=self.random_state,
-            )
+            self.imaging_pca_ = PCA(n_components=self.imaging_pca_components,
+                                    svd_solver="full", random_state=self.random_state)
             X_img = self.imaging_pca_.fit_transform(X_img)
         else:
             self.imaging_pca_ = None
 
         self.rsf_ = RandomSurvivalForest(random_state=self.random_state, **rsf_kwargs)
         self.ext_ = ExtraSurvivalTrees(random_state=self.random_state, **ext_kwargs)
-
         self.rsf_.fit(X_clin, y)
         self.ext_.fit(X_img, y)
 
-        # training-set risk-score statistics, used to standardize at predict time
-        train_risk_clin = self.rsf_.predict(X_clin)
-        train_risk_img = self.ext_.predict(X_img)
-
-        self.clin_mean_ = train_risk_clin.mean()
-        self.clin_std_ = train_risk_clin.std() + 1e-12
-        self.img_mean_ = train_risk_img.mean()
-        self.img_std_ = train_risk_img.std() + 1e-12
-
+        tr_clin, tr_img = self.rsf_.predict(X_clin), self.ext_.predict(X_img)
+        self.clin_mean_, self.clin_std_ = tr_clin.mean(), tr_clin.std() + 1e-12
+        self.img_mean_, self.img_std_ = tr_img.mean(), tr_img.std() + 1e-12
         return self
 
     def predict(self, X):
         X = np.asarray(X)
-        X_clin = X[:, self.clinical_idx]
-        X_img = X[:, self.imaging_idx]
-
+        X_clin, X_img = X[:, self.clinical_idx], X[:, self.imaging_idx]
         if self.imaging_pca_ is not None:
             X_img = self.imaging_pca_.transform(X_img)
-
         risk_clin = (self.rsf_.predict(X_clin) - self.clin_mean_) / self.clin_std_
         risk_img = (self.ext_.predict(X_img) - self.img_mean_) / self.img_std_
-
         return self.weight * risk_clin + (1 - self.weight) * risk_img
 
 
@@ -287,31 +287,26 @@ def get_model_and_param_grid(model_type, feature_set, n_covariates):
     """
     [FIX 1] PCA was applied to the WRONG COLUMNS in the original script.
 
-    get_data() builds combined feature vectors as
-        [volume?, Age, Grading, TNMT, TNMN?] + [imaging features ...]
-    i.e. covariates FIRST — which is exactly what SurvivalEnsemble assumes with
-    clinical_idx = slice(0, n_covariates). The original ColumnTransformer sent
-    slice(0, n_passthrough) to PCA and slice(n_passthrough, None) to
-    "passthrough", i.e. it compressed the 4-5 clinical covariates and let the
-    full high-dimensional imaging block through raw. Every combined feature set
-    is affected. The ensemble's own indexing was already correct.
+    get_data() puts covariates FIRST. The original ColumnTransformer sent
+    slice(0, n_passthrough) to PCA and the remainder to "passthrough", i.e. it
+    compressed the clinical covariates and let the full high-dimensional imaging
+    block through raw. Every combined feature set was affected.
+
+    n_covariates here already includes the histology one-hot columns when the
+    aware regime is being fitted, so they land in the passthrough branch.
     """
     has_covariates, has_imaging = feature_set_blocks(feature_set)
     use_pca = has_imaging and model_type not in ("cox_elastic", "cox_ph", "ensemble")
 
     if use_pca:
-        # svd_solver='full' is required for fractional n_components (0.80, 0.90, ...)
         pca = PCA(random_state=RANDOM_STATE, svd_solver="full")
-
         if n_covariates == 0:
             preprocessor = pca
             pca_param_name = "preprocessor__n_components"
         else:
             preprocessor = ColumnTransformer(
                 transformers=[
-                    # covariates pass through untouched ...
                     ("covariates", "passthrough", slice(0, n_covariates)),
-                    # ... the imaging block is what gets compressed
                     ("pca", pca, slice(n_covariates, None)),
                 ],
                 remainder="drop",
@@ -325,6 +320,13 @@ def get_model_and_param_grid(model_type, feature_set, n_covariates):
 
     if model_type == "rsf":
         clf = RandomSurvivalForest(random_state=RANDOM_STATE)
+
+        param_grid = {
+            "clf__n_estimators": [100, 200, 500],
+            "clf__max_depth": [None, 3, 5, 10],
+            "clf__min_samples_split": [2, 5, 10],
+        }
+
     elif model_type == "extra_trees":
         clf = ExtraSurvivalTrees(random_state=RANDOM_STATE)
     elif model_type == "gradient_boosting":
@@ -333,17 +335,21 @@ def get_model_and_param_grid(model_type, feature_set, n_covariates):
         clf = CoxPHSurvivalAnalysis()
     elif model_type == "cox_elastic":
         clf = CoxnetSurvivalAnalysis()
+
+        param_grid = {
+            "clf__l1_ratio": [0.0, 0.5, 1.0],
+            "clf__alphas": [[0.01, 0.1, 1.0, 10.0]],
+        }
+
     elif model_type == "svm":
         clf = FastSurvivalSVM(random_state=RANDOM_STATE)
     elif model_type == "lipschitz_svm":
         clf = MinlipSurvivalAnalysis()
-
     elif model_type == "ensemble":
         if not has_covariates or not has_imaging:
             raise ValueError(
-                f"feature_set='{feature_set}' does not have both a covariate block "
-                "and an imaging block — the ensemble needs both. "
-                "Use e.g. 'volume_clinical_radiomics' instead."
+                f"feature_set='{feature_set}' lacks a covariate or imaging block; "
+                "the ensemble needs both."
             )
         clf = SurvivalEnsemble(
             clinical_idx=slice(0, n_covariates),
@@ -354,7 +360,6 @@ def get_model_and_param_grid(model_type, feature_set, n_covariates):
             "clf__weight": np.round(np.linspace(0.1, 0.9, 9), 2).tolist(),
             "clf__imaging_pca_components": PCA_VARIANCE_GRID,
         }
-
     else:
         raise ValueError(f"Unsupported model type: {model_type}")
 
@@ -362,7 +367,6 @@ def get_model_and_param_grid(model_type, feature_set, n_covariates):
         [("scaler", StandardScaler()), ("preprocessor", preprocessor), ("clf", clf)],
         memory=MEMORY,
     )
-
     if use_pca:
         param_grid[pca_param_name] = PCA_VARIANCE_GRID
 
@@ -378,11 +382,6 @@ def _n_grid_candidates(param_grid):
 
 def fit_model(model_type, feature_set, n_covariates, X_train, y_train,
               fixed_params=None):
-    """
-    Fit the pipeline. If fixed_params is given, skip tuning and use them directly.
-    If the param grid is empty, skip GridSearchCV — the original script ran 500
-    inner fits to select between zero hyperparameters.
-    """
     pipeline, param_grid = get_model_and_param_grid(model_type, feature_set, n_covariates)
 
     if fixed_params is not None:
@@ -395,47 +394,63 @@ def fit_model(model_type, feature_set, n_covariates, X_train, y_train,
         pipeline.fit(X_train, y_train)
         return pipeline, {}
 
-    n_repeats = (
-        N_INNER_REPEATS_LARGE_GRID
-        if _n_grid_candidates(param_grid) > LARGE_GRID_THRESHOLD
-        else N_INNER_REPEATS
-    )
-    cv_inner = RepeatedKFold(
-        n_splits=N_INNER_SPLITS, n_repeats=n_repeats, random_state=RANDOM_STATE
-    )
-    grid_search = GridSearchCV(
-        pipeline, param_grid, scoring=score_survival_model,
-        cv=cv_inner, refit=True, n_jobs=-1,
-    )
+    n_repeats = (N_INNER_REPEATS_LARGE_GRID
+                 if _n_grid_candidates(param_grid) > LARGE_GRID_THRESHOLD
+                 else N_INNER_REPEATS)
+    cv_inner = RepeatedKFold(n_splits=N_INNER_SPLITS, n_repeats=n_repeats,
+                             random_state=RANDOM_STATE)
+    grid_search = GridSearchCV(pipeline, param_grid, scoring=score_survival_model,
+                               cv=cv_inner, refit=True, n_jobs=-1)
     grid_search.fit(X_train, y_train)
     return grid_search.best_estimator_, grid_search.best_params_
 
 
 def log_fitted_model_info(best_model, model_type, regime, fold_idx):
-    """Log the number of retained PCA components and the ensemble weight."""
     preprocessor = best_model.named_steps["preprocessor"]
-
     n_pca = None
     if isinstance(preprocessor, PCA):
         n_pca = preprocessor.n_components_
     elif isinstance(preprocessor, ColumnTransformer):
         n_pca = preprocessor.named_transformers_["pca"].n_components_
-
     if n_pca is not None:
         mlflow.log_metric(f"{regime}_n_pca_components_fold_{fold_idx}", int(n_pca))
 
     if model_type == "ensemble":
         clf = best_model.named_steps["clf"]
         mlflow.log_metric(f"{regime}_ensemble_weight_fold_{fold_idx}", float(clf.weight))
-        mlflow.log_param(
-            f"{regime}_ensemble_imaging_pca_fold_{fold_idx}",
-            clf.imaging_pca_components,
-        )
-        if getattr(clf, "imaging_pca_", None) is not None:
-            mlflow.log_metric(
-                f"{regime}_ensemble_n_pca_components_fold_{fold_idx}",
-                int(clf.imaging_pca_.n_components_),
-            )
+        mlflow.log_param(f"{regime}_ensemble_imaging_pca_fold_{fold_idx}",
+                         clf.imaging_pca_components)
+
+
+# =============================================================================
+# Regime 3 diagnostic: does the model actually use the subtype label?
+# =============================================================================
+
+def histology_permutation_importance(model, X_test, y_test, hist_slice,
+                                     n_repeats=N_PERMUTATION_REPEATS,
+                                     random_state=RANDOM_STATE):
+    """
+    C-index drop when the histology one-hot block is shuffled across test rows.
+
+    Rows are permuted JOINTLY so every shuffled row is still a valid one-hot
+    vector — shuffling each column independently would produce impossible
+    patients (two subtypes at once, or none) and overstate the importance.
+
+    ~0  -> the label was ignored; regime 3 collapses to regime 2
+    >0  -> the model genuinely conditions on subtype
+    """
+    base = concordance_index_censored(
+        y_test[EVENT_FIELD], y_test[TIME_FIELD], model.predict(X_test))[0]
+
+    rng = np.random.RandomState(random_state)
+    drops = []
+    for _ in range(n_repeats):
+        X_perm = X_test.copy()
+        X_perm[:, hist_slice] = X_test[rng.permutation(len(X_test)), hist_slice]
+        c = concordance_index_censored(
+            y_test[EVENT_FIELD], y_test[TIME_FIELD], model.predict(X_perm))[0]
+        drops.append(base - c)
+    return base, float(np.mean(drops)), float(np.std(drops))
 
 
 # =============================================================================
@@ -450,22 +465,14 @@ def _draw_without_replacement(rng, candidates, n):
 
 
 def _stratified_draw(rng, candidates, pool_events, n_events, n_censored):
-    """Draw n_events event-patients and n_censored censored patients."""
     ev = candidates[pool_events[candidates]]
     cn = candidates[~pool_events[candidates]]
-    return np.concatenate(
-        [_draw_without_replacement(rng, ev, n_events),
-         _draw_without_replacement(rng, cn, n_censored)]
-    )
+    return np.concatenate([_draw_without_replacement(rng, ev, n_events),
+                           _draw_without_replacement(rng, cn, n_censored)])
 
 
 def draw_matched_indices(rng, pool_is_primary, pool_events, n_target, n_events_target,
                          primary_fraction=None, match_event_count=True):
-    """
-    Draw indices into the pooled training set (primary training fold + all other
-    histologies) so that the resulting training set has the same size — and
-    optionally the same number of events — as the histology-specific training fold.
-    """
     all_idx = np.arange(len(pool_events))
     n_censored_target = n_target - n_events_target
 
@@ -475,30 +482,25 @@ def draw_matched_indices(rng, pool_is_primary, pool_events, n_target, n_events_t
                                     n_events_target, n_censored_target)
         return _draw_without_replacement(rng, all_idx, n_target)
 
-    # Forced composition: a fixed share of the budget must come from the primary histology.
     n_primary_budget = int(round(primary_fraction * n_target))
     primary_idx = all_idx[pool_is_primary]
     secondary_idx = all_idx[~pool_is_primary]
-
     n_primary_budget = min(n_primary_budget, len(primary_idx))
     n_secondary_budget = min(n_target - n_primary_budget, len(secondary_idx))
 
     if not match_event_count:
         return np.concatenate([
             _draw_without_replacement(rng, primary_idx, n_primary_budget),
-            _draw_without_replacement(rng, secondary_idx, n_secondary_budget),
-        ])
+            _draw_without_replacement(rng, secondary_idx, n_secondary_budget)])
 
     event_rate = n_events_target / max(n_target, 1)
     n_ev_primary = int(round(event_rate * n_primary_budget))
     n_ev_secondary = int(round(event_rate * n_secondary_budget))
-
     return np.concatenate([
         _stratified_draw(rng, primary_idx, pool_events,
                          n_ev_primary, n_primary_budget - n_ev_primary),
         _stratified_draw(rng, secondary_idx, pool_events,
-                         n_ev_secondary, n_secondary_budget - n_ev_secondary),
-    ])
+                         n_ev_secondary, n_secondary_budget - n_ev_secondary)])
 
 
 # =============================================================================
@@ -513,24 +515,15 @@ def bootstrap_c_index(y_primary, risk_scores, n_bootstrap=N_BOOTSTRAP, seed=RAND
         sample = rng.choice(np.arange(n), size=n, replace=True)
         if y_primary[EVENT_FIELD][sample].sum() < 2:
             continue
-        scores.append(
-            concordance_index_censored(
-                y_primary[EVENT_FIELD][sample],
-                y_primary[TIME_FIELD][sample],
-                risk_scores[sample],
-            )[0]
-        )
+        scores.append(concordance_index_censored(
+            y_primary[EVENT_FIELD][sample], y_primary[TIME_FIELD][sample],
+            risk_scores[sample])[0])
     return np.array(scores)
 
 
 def paired_bootstrap_delta(y_primary, risk_a, risk_b,
                            n_bootstrap=N_BOOTSTRAP, seed=RANDOM_STATE):
-    """
-    Paired bootstrap of C-index(a) - C-index(b) on the SAME resampled patients.
-    This is the comparison to report: the regimes share outer folds and test
-    patients, so an unpaired comparison of two means throws away that pairing
-    and gives needlessly wide intervals.
-    """
+    """Paired bootstrap of C-index(a) - C-index(b) on the SAME resampled patients."""
     rng = np.random.RandomState(seed)
     n = len(y_primary)
     deltas = []
@@ -539,41 +532,31 @@ def paired_bootstrap_delta(y_primary, risk_a, risk_b,
         if y_primary[EVENT_FIELD][sample].sum() < 2:
             continue
         ev, tm = y_primary[EVENT_FIELD][sample], y_primary[TIME_FIELD][sample]
-        c_a = concordance_index_censored(ev, tm, risk_a[sample])[0]
-        c_b = concordance_index_censored(ev, tm, risk_b[sample])[0]
-        deltas.append(c_a - c_b)
+        deltas.append(concordance_index_censored(ev, tm, risk_a[sample])[0]
+                      - concordance_index_censored(ev, tm, risk_b[sample])[0])
     return np.array(deltas)
 
 
 def kaplan_meier_by_risk(y_primary, risk_scores, tag, title):
-    """Median-split risk groups, log-rank test, KM plot. Returns (chisq, p)."""
     median_risk = np.median(risk_scores)
     risk_group = np.where(risk_scores >= median_risk, "high", "low")
-
     chisq, pvalue = compare_survival(y_primary, risk_group)
 
     plt.figure(figsize=(8, 6))
     for group_label in np.unique(risk_group):
         mask = risk_group == group_label
         time_g, surv_g, conf_int = kaplan_meier_estimator(
-            y_primary[EVENT_FIELD][mask], y_primary[TIME_FIELD][mask], conf_type="log-log"
-        )
+            y_primary[EVENT_FIELD][mask], y_primary[TIME_FIELD][mask], conf_type="log-log")
         plt.step(time_g, surv_g, where="post", label=f"{group_label} risk (n={mask.sum()})")
         plt.fill_between(time_g, conf_int[0], conf_int[1], alpha=0.2, step="post")
 
     plt.ylim(0, 1)
-    plt.xlabel("Time")
-    plt.ylabel("Survival probability")
+    plt.xlabel("Time"); plt.ylabel("Survival probability")
     plt.title(f"{title}\nLog-rank p = {pvalue:.4g}")
-    plt.legend(loc="best")
-    plt.grid(alpha=0.3)
-    plt.tight_layout()
+    plt.legend(loc="best"); plt.grid(alpha=0.3); plt.tight_layout()
     filename = f"kaplan_meier_{tag}.png"
-    plt.savefig(filename, dpi=300)
-    plt.close()
+    plt.savefig(filename, dpi=300); plt.close()
     mlflow.log_artifact(filename)
-    os.remove(filename)
-
     return chisq, pvalue
 
 
@@ -583,25 +566,31 @@ def kaplan_meier_by_risk(y_primary, risk_scores, tag, title):
 
 def main(model_type, histology, feature_set):
 
-    mlflow.log_param("model_type", model_type)
-    mlflow.log_param("histology", histology)
-    mlflow.log_param("feature_set", feature_set)
-    mlflow.log_param("n_outer_splits", N_OUTER_SPLITS)
-    mlflow.log_param("n_inner_splits", N_INNER_SPLITS)
-    mlflow.log_param("n_bootstrap", N_BOOTSTRAP)
-    mlflow.log_param("random_state", RANDOM_STATE)
-    mlflow.log_param("n_matched_repeats", N_MATCHED_REPEATS)
-    mlflow.log_param("match_event_count", MATCH_EVENT_COUNT)
-    mlflow.log_param("matched_primary_fraction", MATCHED_PRIMARY_FRACTION)
-    mlflow.log_param("matched_retune", MATCHED_RETUNE)
+    for k, v in [("model_type", model_type), ("histology", histology),
+                 ("feature_set", feature_set), ("n_outer_splits", N_OUTER_SPLITS),
+                 ("n_inner_splits", N_INNER_SPLITS), ("n_bootstrap", N_BOOTSTRAP),
+                 ("random_state", RANDOM_STATE),
+                 ("n_matched_repeats", N_MATCHED_REPEATS),
+                 ("match_event_count", MATCH_EVENT_COUNT),
+                 ("matched_primary_fraction", MATCHED_PRIMARY_FRACTION),
+                 ("matched_retune", MATCHED_RETUNE)]:
+        mlflow.log_param(k, v)
 
     # -------------------------------------------------------------------------
-    # 1. Load data
+    # 1. Load data — blind matrix, and the same data with histology one-hots
     # -------------------------------------------------------------------------
     (X, y, times, events, histologies,
      n_primary, n_secondary, n_covariates) = get_data(histology, feature_set)
 
+    (X_aw, _, _, _, _, _, _, n_cov_aw) = get_data(histology, feature_set,
+                                                  include_histology=True)
+
+    # where the one-hot block sits inside X_aw
+    n_hist = len(HISTOLOGY_CATEGORIES)
+    hist_slice = slice(n_cov_aw - n_hist, n_cov_aw)
+
     X_primary, X_secondary = X[:n_primary], X[n_primary:]
+    Xaw_primary, Xaw_secondary = X_aw[:n_primary], X_aw[n_primary:]
     y_primary, y_secondary = y[:n_primary], y[n_primary:]
     events_primary, events_secondary = events[:n_primary], events[n_primary:]
 
@@ -613,164 +602,150 @@ def main(model_type, histology, feature_set):
     mlflow.log_metric("n_covariates", n_covariates)
 
     if n_secondary == 0:
-        raise ValueError("No secondary histologies found — agnostic/matched impossible.")
+        raise ValueError("No secondary histologies — agnostic/aware/matched impossible.")
 
     # -------------------------------------------------------------------------
-    # 2. Outer CV — identical folds shared by all three regimes
+    # 2. Outer CV — identical folds shared by all four regimes
     # -------------------------------------------------------------------------
-    outer_cv = StratifiedKFold(
-        n_splits=N_OUTER_SPLITS, shuffle=True, random_state=RANDOM_STATE
-    )
+    outer_cv = StratifiedKFold(n_splits=N_OUTER_SPLITS, shuffle=True,
+                               random_state=RANDOM_STATE)
     folds = list(outer_cv.split(X_primary, events_primary))
 
-    # [FIX 2] risk score vectors are sized to the PRIMARY cohort only.
-    #
-    # The original allocated np.zeros(n_samples) with n_samples = primary + secondary,
-    # but the outer CV only ever writes into primary indices. Every secondary patient
-    # kept a risk score of exactly 0.0 — and the bootstrap CI, the median risk split,
-    # the log-rank test and the KM plot were all computed over the FULL y. So for
-    # every 'all_*' run those numbers were computed on a cohort where the majority of
-    # patients had a constant risk score.
-    risk = {
-        "specific": np.zeros(n_primary),
-        "agnostic": np.zeros(n_primary),
-    }
-    fold_c = {"specific": [], "agnostic": []}
+    # [FIX 2] risk score vectors are sized to the PRIMARY cohort only. The
+    # original allocated np.zeros(primary + secondary) but only ever wrote into
+    # primary indices, leaving every secondary patient at exactly 0.0 — and then
+    # computed the bootstrap CI, median split, log-rank test and KM plot over the
+    # FULL y. For every pooled run those numbers came from a cohort in which the
+    # majority of patients had a constant risk score.
+    risk = {r: np.zeros(n_primary) for r in ("specific", "agnostic", "aware")}
+    fold_c = {r: [] for r in ("specific", "agnostic", "aware")}
     risk_matched = np.zeros((N_MATCHED_REPEATS, n_primary))
+    perm_drops = []
 
     # -------------------------------------------------------------------------
-    # 3. Fit all three regimes per fold
+    # 3. Fit all four regimes per fold
     # -------------------------------------------------------------------------
     for fold_idx, (train_idx, test_idx) in enumerate(folds, start=1):
 
-        X_tr_primary, y_tr_primary = X_primary[train_idx], y_primary[train_idx]
+        X_tr, y_tr = X_primary[train_idx], y_primary[train_idx]
         X_test = X_primary[test_idx]
 
-        # --- specific --------------------------------------------------------
+        # --- regime 1: specific ---------------------------------------------
+        # Fitted WITHOUT the histology columns on purpose: every patient here is
+        # the same subtype, so the one-hots would be constant and carry nothing.
         model_spec, params_spec = fit_model(
-            model_type, feature_set, n_covariates, X_tr_primary, y_tr_primary
-        )
+            model_type, feature_set, n_covariates, X_tr, y_tr)
         risk["specific"][test_idx] = model_spec.predict(X_test)
         log_fitted_model_info(model_spec, model_type, "specific", fold_idx)
 
-        # --- agnostic --------------------------------------------------------
-        X_tr_pooled = np.vstack([X_tr_primary, X_secondary])
-        y_tr_pooled = np.hstack([y_tr_primary, y_secondary])
-
+        # --- regime 2: agnostic-blind ---------------------------------------
+        X_tr_pooled = np.vstack([X_tr, X_secondary])
+        y_tr_pooled = np.hstack([y_tr, y_secondary])
         model_agn, params_agn = fit_model(
-            model_type, feature_set, n_covariates, X_tr_pooled, y_tr_pooled
-        )
+            model_type, feature_set, n_covariates, X_tr_pooled, y_tr_pooled)
         risk["agnostic"][test_idx] = model_agn.predict(X_test)
         log_fitted_model_info(model_agn, model_type, "agnostic", fold_idx)
 
-        for regime in ("specific", "agnostic"):
+        # --- regime 3: agnostic-aware ---------------------------------------
+        Xaw_tr_pooled = np.vstack([Xaw_primary[train_idx], Xaw_secondary])
+        Xaw_test = Xaw_primary[test_idx]
+        model_aw, params_aw = fit_model(
+            model_type, feature_set, n_cov_aw, Xaw_tr_pooled, y_tr_pooled)
+        risk["aware"][test_idx] = model_aw.predict(Xaw_test)
+        log_fitted_model_info(model_aw, model_type, "aware", fold_idx)
+
+        base_c, drop_mean, drop_std = histology_permutation_importance(
+            model_aw, Xaw_test, y_primary[test_idx], hist_slice)
+        perm_drops.append(drop_mean)
+        mlflow.log_metric(f"aware_hist_perm_drop_fold_{fold_idx}", drop_mean)
+        mlflow.log_metric(f"aware_hist_perm_drop_std_fold_{fold_idx}", drop_std)
+
+        for regime in ("specific", "agnostic", "aware"):
             c = concordance_index_censored(
-                y_primary[EVENT_FIELD][test_idx],
-                y_primary[TIME_FIELD][test_idx],
-                risk[regime][test_idx],
-            )[0]
+                y_primary[EVENT_FIELD][test_idx], y_primary[TIME_FIELD][test_idx],
+                risk[regime][test_idx])[0]
             fold_c[regime].append(c)
             mlflow.log_metric(f"{regime}_c_index_fold_{fold_idx}", c)
 
         mlflow.log_param(f"specific_best_params_fold_{fold_idx}", params_spec)
         mlflow.log_param(f"agnostic_best_params_fold_{fold_idx}", params_agn)
-        mlflow.log_metric(f"specific_n_train_fold_{fold_idx}", len(y_tr_primary))
+        mlflow.log_param(f"aware_best_params_fold_{fold_idx}", params_aw)
+        mlflow.log_metric(f"specific_n_train_fold_{fold_idx}", len(y_tr))
         mlflow.log_metric(f"agnostic_n_train_fold_{fold_idx}", len(y_tr_pooled))
 
-        print(
-            f"Fold {fold_idx}: specific C = {fold_c['specific'][-1]:.3f} "
-            f"(n={len(y_tr_primary)}) | agnostic C = {fold_c['agnostic'][-1]:.3f} "
-            f"(n={len(y_tr_pooled)})"
-        )
+        print(f"Fold {fold_idx}: specific {fold_c['specific'][-1]:.3f} | "
+              f"agnostic {fold_c['agnostic'][-1]:.3f} | "
+              f"aware {fold_c['aware'][-1]:.3f} "
+              f"(histology permutation drop {drop_mean:+.3f})")
 
-        # --- matched (B2) ----------------------------------------------------
-        pool_X = X_tr_pooled
-        pool_y = y_tr_pooled
+        # --- regime 4-equivalent control: matched ---------------------------
+        pool_X, pool_y = X_tr_pooled, y_tr_pooled
         pool_events = np.hstack([events_primary[train_idx], events_secondary])
-        pool_is_primary = np.hstack([
-            np.ones(len(train_idx), dtype=bool),
-            np.zeros(n_secondary, dtype=bool),
-        ])
-
-        # the budget: exactly what the histology-specific model gets
+        pool_is_primary = np.hstack([np.ones(len(train_idx), dtype=bool),
+                                     np.zeros(n_secondary, dtype=bool)])
         n_target = len(train_idx)
         n_events_target = int(events_primary[train_idx].sum())
-
-        # Reusing the agnostic fold's hyperparameters isolates the effect of
-        # training-set size from tuning noise, and avoids re-running the inner CV
-        # N_MATCHED_REPEATS times — which matters most for the ensemble, whose
-        # grid has 45 candidates. No test-fold leakage: the agnostic fit never
-        # saw these test patients either.
         fixed = None if MATCHED_RETUNE else params_agn
-
-        print(f"  matched: n={n_target} ({n_events_target} events) "
-              f"from a pool of {len(pool_y)}, {N_MATCHED_REPEATS} repetitions")
 
         for rep in range(N_MATCHED_REPEATS):
             rng = np.random.RandomState(RANDOM_STATE + 10_000 * fold_idx + rep)
-
             for _attempt in range(20):
                 sel = draw_matched_indices(
-                    rng=rng,
-                    pool_is_primary=pool_is_primary,
-                    pool_events=pool_events,
-                    n_target=n_target,
-                    n_events_target=n_events_target,
+                    rng=rng, pool_is_primary=pool_is_primary, pool_events=pool_events,
+                    n_target=n_target, n_events_target=n_events_target,
                     primary_fraction=MATCHED_PRIMARY_FRACTION,
-                    match_event_count=MATCH_EVENT_COUNT,
-                )
+                    match_event_count=MATCH_EVENT_COUNT)
                 if pool_events[sel].sum() >= MIN_EVENTS_IN_TRAIN:
                     break
-
-            model_matched, _ = fit_model(
-                model_type, feature_set, n_covariates,
-                pool_X[sel], pool_y[sel], fixed_params=fixed,
-            )
+            model_matched, _ = fit_model(model_type, feature_set, n_covariates,
+                                         pool_X[sel], pool_y[sel], fixed_params=fixed)
             risk_matched[rep, test_idx] = model_matched.predict(X_test)
 
         mlflow.log_metric(f"matched_n_target_fold_{fold_idx}", n_target)
         mlflow.log_metric(f"matched_n_events_target_fold_{fold_idx}", n_events_target)
 
     # -------------------------------------------------------------------------
-    # 4. Matched: distribution of the C-index over subsampling repetitions
+    # 4. Regime 3 diagnostic summary
+    # -------------------------------------------------------------------------
+    mlflow.log_metric("aware_hist_perm_drop_mean", float(np.mean(perm_drops)))
+    print(f"\nHistology permutation importance (aware regime): "
+          f"{np.mean(perm_drops):+.3f} mean C-index drop")
+    if abs(np.mean(perm_drops)) < 0.005:
+        print("  -> the subtype label is being ignored; regime 3 has collapsed "
+              "onto regime 2 for this configuration.")
+
+    # -------------------------------------------------------------------------
+    # 5. Matched: distribution over subsampling repetitions
     # -------------------------------------------------------------------------
     matched_rep_c = np.array([
-        concordance_index_censored(
-            y_primary[EVENT_FIELD], y_primary[TIME_FIELD], risk_matched[rep]
-        )[0]
-        for rep in range(N_MATCHED_REPEATS)
-    ])
+        concordance_index_censored(y_primary[EVENT_FIELD], y_primary[TIME_FIELD],
+                                   risk_matched[rep])[0]
+        for rep in range(N_MATCHED_REPEATS)])
 
-    mlflow.log_metric("matched_rep_c_index_mean", float(matched_rep_c.mean()))
-    mlflow.log_metric("matched_rep_c_index_std", float(matched_rep_c.std()))
-    mlflow.log_metric("matched_rep_c_index_median", float(np.median(matched_rep_c)))
-    mlflow.log_metric("matched_rep_c_index_p2_5", float(np.percentile(matched_rep_c, 2.5)))
-    mlflow.log_metric("matched_rep_c_index_p97_5", float(np.percentile(matched_rep_c, 97.5)))
+    for name, val in [("mean", matched_rep_c.mean()), ("std", matched_rep_c.std()),
+                      ("median", np.median(matched_rep_c)),
+                      ("p2_5", np.percentile(matched_rep_c, 2.5)),
+                      ("p97_5", np.percentile(matched_rep_c, 97.5))]:
+        mlflow.log_metric(f"matched_rep_c_index_{name}", float(val))
 
-    # Risk scores are on different scales across repetitions (and across models),
-    # so rank-normalise each repetition before averaging into one vector.
+    # Different repetitions produce risk scores on different scales, so
+    # rank-normalise each before averaging.
     risk["matched"] = np.mean(
-        [rankdata(risk_matched[rep]) for rep in range(N_MATCHED_REPEATS)], axis=0
-    )
+        [rankdata(risk_matched[rep]) for rep in range(N_MATCHED_REPEATS)], axis=0)
 
     plt.figure(figsize=(7, 5))
     plt.hist(matched_rep_c, bins=25, alpha=0.8, label="matched (per repetition)")
-    plt.axvline(np.mean(fold_c["specific"]), color="C1", linestyle="--",
-                label=f"specific = {np.mean(fold_c['specific']):.3f}")
-    plt.axvline(np.mean(fold_c["agnostic"]), color="C2", linestyle="--",
-                label=f"agnostic = {np.mean(fold_c['agnostic']):.3f}")
-    plt.xlabel("C-index")
-    plt.ylabel("Repetitions")
-    plt.title(f"{histology} | {feature_set} | {model_type}\nB2 size-matched control")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig("matched_c_index_distribution.png", dpi=300)
-    plt.close()
+    for reg, color in [("specific", "C1"), ("agnostic", "C2"), ("aware", "C3")]:
+        plt.axvline(np.mean(fold_c[reg]), color=color, linestyle="--",
+                    label=f"{reg} = {np.mean(fold_c[reg]):.3f}")
+    plt.xlabel("C-index"); plt.ylabel("Repetitions")
+    plt.title(f"{histology} | {feature_set} | {model_type}\nsize-matched control")
+    plt.legend(fontsize=8); plt.tight_layout()
+    plt.savefig("matched_c_index_distribution.png", dpi=300); plt.close()
     mlflow.log_artifact("matched_c_index_distribution.png")
-    os.remove("matched_c_index_distribution.png")
 
     # -------------------------------------------------------------------------
-    # 5. Per-regime metrics
+    # 6. Per-regime metrics
     # -------------------------------------------------------------------------
     boot = {}
     print()
@@ -781,11 +756,9 @@ def main(model_type, histology, feature_set):
 
         boot[regime] = bootstrap_c_index(y_primary, risk[regime])
         lo, hi = np.percentile(boot[regime], [2.5, 97.5])
-
         mlflow.log_metric(f"{regime}_bootstrap_c_index_mean", float(boot[regime].mean()))
         mlflow.log_metric(f"{regime}_bootstrap_c_index_lower", float(lo))
         mlflow.log_metric(f"{regime}_bootstrap_c_index_upper", float(hi))
-
         print(f"{regime:>9}: bootstrap C = {boot[regime].mean():.3f} "
               f"(95% CI [{lo:.3f}, {hi:.3f}])")
 
@@ -793,8 +766,7 @@ def main(model_type, histology, feature_set):
             chisq, pvalue = kaplan_meier_by_risk(
                 y_primary, risk[regime],
                 tag=f"{histology}_{feature_set}_{model_type}_{regime}",
-                title=f"{histology} | {regime} | {feature_set} | {model_type}",
-            )
+                title=f"{histology} | {regime} | {feature_set} | {model_type}")
             mlflow.log_metric(f"{regime}_logrank_chisq", float(chisq))
             mlflow.log_metric(f"{regime}_logrank_pvalue", float(pvalue))
             mlflow.log_param(f"{regime}_significant", bool(pvalue < 0.05 and lo > 0.5))
@@ -803,10 +775,12 @@ def main(model_type, histology, feature_set):
             mlflow.log_param(f"{regime}_km_error", str(exc))
 
     # -------------------------------------------------------------------------
-    # 6. Paired comparisons — this is the B2 result
+    # 7. Paired comparisons
     # -------------------------------------------------------------------------
     print()
     comparisons = [
+        ("aware", "agnostic"),    # does the subtype label help?      <- regime 3
+        ("aware", "specific"),    # does aware pooling beat going alone?
         ("agnostic", "specific"),
         ("matched", "specific"),
         ("agnostic", "matched"),
@@ -814,34 +788,25 @@ def main(model_type, histology, feature_set):
     for a, b in comparisons:
         deltas = paired_bootstrap_delta(y_primary, risk[a], risk[b])
         lo, hi = np.percentile(deltas, [2.5, 97.5])
-        # two-sided bootstrap p-value for delta = 0
         p = 2 * min((deltas <= 0).mean(), (deltas >= 0).mean())
-
         name = f"delta_{a}_vs_{b}"
         mlflow.log_metric(f"{name}_mean", float(deltas.mean()))
         mlflow.log_metric(f"{name}_lower", float(lo))
         mlflow.log_metric(f"{name}_upper", float(hi))
         mlflow.log_metric(f"{name}_pvalue", float(p))
-
-        print(f"  {a} - {b}: {deltas.mean():+.3f} "
+        print(f"  {a:9s} - {b:9s}: {deltas.mean():+.3f} "
               f"(95% CI [{lo:+.3f}, {hi:+.3f}], p = {p:.3g})")
 
     # -------------------------------------------------------------------------
-    # 7. Persist out-of-fold predictions for later paired / pooled analyses
+    # 8. Persist out-of-fold predictions
     # -------------------------------------------------------------------------
-    np.savez(
-        "oof_risk_scores.npz",
-        specific=risk["specific"],
-        agnostic=risk["agnostic"],
-        matched=risk["matched"],
-        matched_matrix=risk_matched,
-        matched_rep_c=matched_rep_c,
-        event=y_primary[EVENT_FIELD],
-        duration=y_primary[TIME_FIELD],
-    )
+    np.savez("oof_risk_scores.npz",
+             specific=risk["specific"], agnostic=risk["agnostic"],
+             aware=risk["aware"], matched=risk["matched"],
+             matched_matrix=risk_matched, matched_rep_c=matched_rep_c,
+             hist_perm_drops=np.array(perm_drops),
+             event=y_primary[EVENT_FIELD], duration=y_primary[TIME_FIELD])
     mlflow.log_artifact("oof_risk_scores.npz")
-
-    os.remove("oof_risk_scores.npz")
 
 
 # =============================================================================
@@ -856,36 +821,27 @@ if __name__ == "__main__":
         "clinical_radiomics", "clinical_ctfm", "clinical_omnislicer",
         "volume_clinical_radiomics", "volume_clinical_ctfm", "volume_clinical_omnislicer",
     ]
-    MODEL_TYPES = [
-        "rsf", "extra_trees", "gradient_boosting", "ensemble",
-    ]
+    MODEL_TYPES = ["cox_elastic"]
+                # "rsf", "extra_trees", "gradient_boosting",
+                #  "cox_elastic", "svm", "lipschitz_svm", "ensemble"]
     HISTOLOGIES = ["syn", "mfh", "lipo"]
 
-    mlflow.set_experiment("European_Journal_of_Radiology")
+    mlflow.set_experiment("DEGRO_journal_extension_aware")
 
     for feature_set in FEATURE_SETS:
         has_covariates, has_imaging = feature_set_blocks(feature_set)
-
         for model_type in MODEL_TYPES:
-
-            # the ensemble needs both a covariate block and an imaging block
             if model_type == "ensemble" and not (has_covariates and has_imaging):
                 continue
-
             for histology in HISTOLOGIES:
-
                 print("\n" + "#" * 79)
                 print(f"# {model_type} | {histology} | {feature_set} "
-                      f"| specific + agnostic + matched")
+                      f"| specific + agnostic + aware + matched")
                 print("#" * 79 + "\n")
-
                 mlflow.start_run()
                 try:
-                    main(
-                        model_type=model_type,
-                        histology=histology,
-                        feature_set=feature_set,
-                    )
+                    main(model_type=model_type, histology=histology,
+                         feature_set=feature_set)
                 except Exception as exc:
                     print(f"RUN FAILED: {exc}")
                     mlflow.log_param("run_error", str(exc))
